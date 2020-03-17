@@ -3,6 +3,8 @@ kind: Grafana
 metadata:
   name: example-grafana
 spec:
+  ingress:
+    enabled: True
   config:
     log:
       mode: "console"
@@ -13,8 +15,6 @@ spec:
     auth:
       disable_login_form: False
       disable_signout_menu: True
-    auth.basic:
-      enabled: False
     auth.anonymous:
       enabled: True
   dashboardLabelSelector:

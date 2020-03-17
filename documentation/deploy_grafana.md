@@ -6,6 +6,42 @@ This document describes how to get up and running with a new Grafana instance on
 
 The first step is to install the Grafana operator to a namespace in your cluster.
 
+There are two options for this procedure, automated via Ansible, or manually running kubectl/oc commands.
+
+### Automated Procedure
+
+Cluster admin install cluster resources.
+For more details and additional parameters see [grafana-operator-cluster-resources.yaml](../deploy/ansible/README.md#grafana-operator-cluster-resourcesyaml).
+```sh
+ansible-playbook deploy/ansible/grafana-operator-cluster-resources.yaml \
+  -e k8s_host=https://ocp.example.xyz \
+  -e k8s_username=admin1 \
+  -e k8s_password=secret \
+  -e grafana_operator_namespace=grafana
+```
+
+Optional: If `grafana_operator_args_scan_all` is set to `true` for the `grafana-operator-namespace-resources.yaml` playbook then Cluster Admin needs to run this playbook to allow operator to scan all namespaces for dashboards
+For more details and additional parameters see [grafana-operator-cluster-dashboards-scan.yaml](../deploy/ansible/README.md#grafana-operator-cluster-dashboards-scanyaml).
+```sh
+ansible-playbook deploy/ansible/grafana-operator-cluster-dashboards-scan.yaml \
+  -e k8s_host=https://ocp.example.xyz \
+  -e k8s_username=admin1 \
+  -e k8s_password=secret \
+  -e grafana_operator_namespace=grafana
+```
+
+Self provisioner install operator
+For more details and additional parameters see [grafana-operator-namespace-resources.yaml](../deploy/ansible/README.md#grafana-operator-namespace-resourcesyaml).
+```sh
+ansible-playbook deploy/ansible/grafana-operator-namespace-resources.yaml \
+  -e k8s_host=https://ocp.example.xyz \
+  -e k8s_username=project_creator \
+  -e k8s_password=secret \
+  -e grafana_operator_namespace=grafana
+```
+
+### Manual Procedure
+
 To create a namespace named `grafana` run:
 
 ```sh
@@ -53,11 +89,11 @@ The operator accepts a number of flags that can be passed in the `args` section 
 * *--grafana-plugins-init-container-image*: overrides the Grafana Plugins Init Container image, defaults to `quay.io/integreatly/grafana_plugins_init`.
 * *--grafana-plugins-init-container-tag*: overrides the Grafana Plugins Init Container tag, defaults to `0.0.2`.
 * *--scan-all*: watch for dashboards in all namespaces. This requires the the operator service account to have cluster wide permissions to `get`, `list`, `update` and `watch` dashboards. See `deploy/cluster_roles`.
-* *--openshift*: force the operator to use a [route](https://docs.openshift.com/container-platform/3.11/architecture/networking/routes.html) instead of an [ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/). Note that routes are only supported on OpenShift.
-* *--pod-label-value*: override the value of the `app` label that gets attached to pods and other resources.
-
+* *--namespaces*: watch for dashboards in a list of namespaces. Mutually exclusive with `--scan-all`.
 
 See `deploy/operator.yaml` for an example.
+
+If using the automated Ansible installer see the [grafana-operator-namespace-resources.yaml - Parameters](../deploy/ansible/README.md#parameters-1) for the equivlant parameters.
 
 ## Deploying Grafana
 
@@ -65,16 +101,20 @@ Create a custom resource of type `Grafana`, or use the one in `deploy/examples/G
 
 The resource accepts the following properties in it's `spec`:
 
-* *hostname*:  The host to be used for the [ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/). Ignored when `--openshift` is set.
 * *dashboardLabelSelector*: A list of either `matchLabels` or `matchExpressions` to filter the dashboards before importing them.
 * *containers*: Extra containers to be added to the Grafana deployment. Can be used for example to add auth proxy side cars.
-* *secrets*: A list of secrets that are added as volumes to the deployment. Mostly useful in combination with extra `containers`.
+* *secrets*: A list of secrets that are added as volumes to the deployment. Useful in combination with extra `containers` or when extra configuraton files are required.
+* *configMaps*: A list of config maps that are added as volumes to the deployment. Useful in combination with extra `containers` or when extra configuraton files are required.
 * *config*: The properties used to generate `grafana.ini`. All properties defined in the [official documentation](https://grafana.com/docs/installation/configuration/) are supported although some of them are not allowed to be overridden (path configuration). See `deploy/examples/Grafana.yaml` for an example.  
-* *createRoute*: Force the operator to create a Route instead of an Ingress even if the `--openshift` flag is not set.
+* *ingress*: Allows configuring the Ingress / Route resource (see [here](#configuring-the-ingress-or-route)).
+* *service*: Allows configuring the Service resource (see [here](#configuring-the-service)).
+* *serviceAccount*: Allows adding extra labels and annotations to the Grafana service account.
+* *deployment*: Allows configuring the deployment (see [here](#configuring-the-deployment)).
+* *resources*: Allows configuring the requests and limits for the Grafana pod (see [here](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.16/#resourcerequirements-v1-core)).
+* *client*: Grafana client options (see [here](#configuring-grafana-api-access)).
+* *compat*: Compatibility options with older dashboard formats (see [here]()).
 
-The other accepted properties are `logLevel`, `adminUser`, `adminPassword`, `basicAuth`, `disableLoginForm`, `disableSignoutMenu` and `anonymous`. They are supported for legacy reasons, but new instances should use the `config` field. If a value is set in `config` then it will override the legacy field. 
-
-*NOTE*: setting `hostname` on Ingresses is not permitted on OpenShift. We recommend using the `--openshift` flag which will use a `Route` with an automatically assigned host instead. You can still use `Ingress` on OpenShift if you don't provide a `hostname` in the `Grafana` resource.
+*NOTE*: by default no Ingress or Route is created. It can be enabled with `spec.ingress.enabled`.
 
 To create a new Grafana instance in the `grafana` namespace, run:
 
@@ -92,6 +132,97 @@ grafana-ingress   grafana.apps.127.0.0.1.nip.io             80        28s
 
 ## Config reconciliation
 
-When the config object in the `Grafana` CR is modified, then `grafana.ini` will be automatically updated and Grafana will be restarted.
+When the config object in the `Grafana` CR is modified, the `grafana.ini` will be automatically updated and Grafana will be restarted.
 
-*NOTE*: there is a known issue when removing whole sections from the config object. The operator might not detect the update in such cases. As a workaround we recommend to leave the section header in place and only removing all the sections properties.
+## Configuring the Ingress or Route
+
+By default the operator will not create an Ingress or Route. This can be enabled via `spec.ingress` in the `Grafana` CR. 
+The operator will create a Route when running on OpenShift, otherwise an Ingress. Various other properties can also be configured:
+
+```yaml
+spec:
+  ingress:
+    enabled:  <Boolean>     # Create an Ingress (or Route if on OpenShift)
+    hostname: <String>      # Sets the hostname. Assigned automatically on OpenShift if not provided
+    tlsEnabled: <Boolean>   # Enable TLS on Ingress
+    tlsSecretName: <String> # TLS secret name in the same namespace
+    targetPort: <String>    # Which port to target on the service
+    termination: <String>   # TLS termination type (defaults to edge, other options are reencrypt or passthrough)
+    labels:                 # Additional labels for the Ingress or Route
+      app: grafana
+      ...
+    annotations:            # Additional annotations for the Ingress or Route
+      app: grafana
+      ...
+    path:                   # Sets the path of the Ingress. Ignored for Routes
+```
+
+## Configuring the Service
+
+Various properties of the Service can be configured:
+
+```yaml
+spec:
+  service:
+    labels:                 # Additional labels for the Service
+      app: grafana
+      ...
+    annotations:            # Additional annotations for the Service
+      app: grafana
+      ...
+    type: NodePort          # Set Service type, either NodePort, ClusterIP or LoadBalancer
+    ports:                  # Additional ports to add to the service
+      - name: grafana-proxy
+        port: 9091
+        protocol: TCP
+        targetPort: ...
+        
+```
+
+## Configuring the Deployment
+
+Various properties of the Deployment can be configured:
+
+```yaml
+spec:
+  deployment:
+    labels:                 # Additional labels for the Deployment
+      app: grafana
+      ...
+    annotations:            # Additional annotations for the Deployment
+      app: grafana
+      ...
+    replicas: <Number>      # Number of replicas. If more than one is selected, a shared database should be configured.
+    nodeSelector: 
+      app: grafana          # Assign grafana pods to a run on specific nodes.
+     ...
+    tolerations:            # Run grafana pods on tainted nodes.
+     ...
+    affinity:               # Affinity parameters shall support node, pod affinity and anti-affinity usecases.
+    ...
+    securityContext:        # Run grafana pods with security context
+```
+
+## Configuring Grafana API access
+
+Grafana dashboards are imported using the Grafana API. The following options are available to configure the API access:
+
+```yaml
+spec:
+  client:
+    timeout: <Number>         # Timeout in seconds for API requests (defaults to 5 seconds).
+    preferService: <Boolean>  # If an Ingress or Route is available, the operator will attempt to use those for API access. This flag forces it to use the Service instead.
+```
+
+## Compatibility with older dashboard formats
+
+This section contains flag that allow the operator to modify older dashboards in a way that allow importing to newer Grafana versions.
+
+NOTE: (*deprecated*) should no longer be used as of v3.0.2.  
+
+```yaml
+spec:
+  compat:
+    fixAnnotations: <Boolean>   # Allows importing dashboards that specify annotation tags as arrays instead of strings.
+    fixHeights: <Boolean>       # Allows importing dashboards that have a height property encoded as number
+```

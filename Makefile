@@ -1,7 +1,7 @@
-ORG=integreatly
+ORG?=integreatly
 NAMESPACE=grafana
 PROJECT=grafana-operator
-REG=quay.io
+REG?=quay.io
 SHELL=/bin/bash
 TAG?=latest
 PKG=github.com/integr8ly/grafana-operator
@@ -16,7 +16,7 @@ setup/dep:
 .PHONY: setup/travis
 setup/travis:
 	@echo Installing Operator SDK
-	@curl -Lo operator-sdk https://github.com/operator-framework/operator-sdk/releases/download/v0.8.1/operator-sdk-v0.8.1-x86_64-linux-gnu && chmod +x operator-sdk && sudo mv operator-sdk /usr/local/bin/
+	@curl -Lo operator-sdk https://github.com/operator-framework/operator-sdk/releases/download/v0.12.0/operator-sdk-v0.12.0-x86_64-linux-gnu && chmod +x operator-sdk && sudo mv operator-sdk /usr/local/bin/
 
 .PHONY: code/run
 code/run:

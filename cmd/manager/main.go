@@ -4,15 +4,21 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/integr8ly/grafana-operator/pkg/apis"
-	"github.com/integr8ly/grafana-operator/pkg/controller"
-	"github.com/integr8ly/grafana-operator/pkg/controller/common"
-	"github.com/integr8ly/grafana-operator/pkg/controller/grafanadashboard"
-	"github.com/integr8ly/grafana-operator/version"
+	"github.com/integr8ly/grafana-operator/v3/pkg/apis"
+	"github.com/integr8ly/grafana-operator/v3/pkg/controller"
+	"github.com/integr8ly/grafana-operator/v3/pkg/controller/common"
+	config2 "github.com/integr8ly/grafana-operator/v3/pkg/controller/config"
+	"github.com/integr8ly/grafana-operator/v3/pkg/controller/grafanadashboard"
+	"github.com/integr8ly/grafana-operator/v3/version"
+	routev1 "github.com/openshift/api/route/v1"
 	"github.com/operator-framework/operator-sdk/pkg/k8sutil"
 	"github.com/operator-framework/operator-sdk/pkg/leader"
+	"github.com/operator-framework/operator-sdk/pkg/metrics"
 	"github.com/operator-framework/operator-sdk/pkg/ready"
 	sdkVersion "github.com/operator-framework/operator-sdk/version"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"k8s.io/client-go/rest"
 	"os"
@@ -21,6 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 	"sigs.k8s.io/controller-runtime/pkg/runtime/signals"
+	"strings"
 )
 
 var log = logf.Log.WithName("cmd")
@@ -28,9 +35,13 @@ var flagImage string
 var flagImageTag string
 var flagPluginsInitContainerImage string
 var flagPluginsInitContainerTag string
-var flagPodLabelValue string
+var flagNamespaces string
 var scanAll bool
-var openshift bool
+
+var (
+	metricsHost       = "0.0.0.0"
+	metricsPort int32 = 8080
+)
 
 func printVersion() {
 	log.Info(fmt.Sprintf("Go Version: %s", runtime.Version()))
@@ -45,16 +56,18 @@ func init() {
 	flagset.StringVar(&flagImageTag, "grafana-image-tag", "", "Overrides the default Grafana image tag")
 	flagset.StringVar(&flagPluginsInitContainerImage, "grafana-plugins-init-container-image", "", "Overrides the default Grafana Plugins Init Container image")
 	flagset.StringVar(&flagPluginsInitContainerTag, "grafana-plugins-init-container-tag", "", "Overrides the default Grafana Plugins Init Container tag")
-	flagset.StringVar(&flagPodLabelValue, "pod-label-value", common.PodLabelDefaultValue, "Overrides the default value of the app label")
+	flagset.StringVar(&flagNamespaces, "namespaces", "", "Namespaces to scope the interaction of the Grafana operator. Mutually exclusive with --scan-all")
 	flagset.BoolVar(&scanAll, "scan-all", false, "Scans all namespaces for dashboards")
-	flagset.BoolVar(&openshift, "openshift", false, "Use Route instead of Ingress")
 	flagset.Parse(os.Args[1:])
 }
 
 // Starts a separate controller for the dashboard reconciliation in the background
-func startDashboardController(ns string, cfg *rest.Config, signalHandler <-chan struct{}) {
+func startDashboardController(ns string, cfg *rest.Config, signalHandler <-chan struct{}, autodetectChannel chan schema.GroupVersionKind) {
 	// Create a new Cmd to provide shared dependencies and start components
-	dashboardMgr, err := manager.New(cfg, manager.Options{Namespace: ns})
+	dashboardMgr, err := manager.New(cfg, manager.Options{
+		MetricsBindAddress: "0",
+		Namespace:          ns,
+	})
 	if err != nil {
 		log.Error(err, "")
 		os.Exit(1)
@@ -67,7 +80,7 @@ func startDashboardController(ns string, cfg *rest.Config, signalHandler <-chan 
 	}
 
 	// Use a separate manager for the dashboard controller
-	grafanadashboard.Add(dashboardMgr)
+	grafanadashboard.Add(dashboardMgr, ns)
 
 	go func() {
 		if err := dashboardMgr.Start(signalHandler); err != nil {
@@ -75,6 +88,22 @@ func startDashboardController(ns string, cfg *rest.Config, signalHandler <-chan 
 			os.Exit(1)
 		}
 	}()
+}
+
+// Get the trimmed and sanitized list of namespaces (if --namespaces was provided)
+func getSanitizedNamespaceList() []string {
+	provided := strings.Split(flagNamespaces, ",")
+	var selected []string
+
+	for _, v := range provided {
+		v = strings.TrimSpace(v)
+
+		if v != "" {
+			selected = append(selected, v)
+		}
+	}
+
+	return selected
 }
 
 func main() {
@@ -92,24 +121,36 @@ func main() {
 		os.Exit(1)
 	}
 
+	if scanAll && flagNamespaces != "" {
+		fmt.Fprint(os.Stderr, "--scan-all and --namespaces both set. Please provide only one")
+		os.Exit(1)
+	}
+
 	// Controller configuration
-	controllerConfig := common.GetControllerConfig()
-	controllerConfig.AddConfigItem(common.ConfigGrafanaImage, flagImage)
-	controllerConfig.AddConfigItem(common.ConfigGrafanaImageTag, flagImageTag)
-	controllerConfig.AddConfigItem(common.ConfigPluginsInitContainerImage, flagPluginsInitContainerImage)
-	controllerConfig.AddConfigItem(common.ConfigPluginsInitContainerTag, flagPluginsInitContainerTag)
-	controllerConfig.AddConfigItem(common.ConfigPodLabelValue, flagPodLabelValue)
-	controllerConfig.AddConfigItem(common.ConfigOperatorNamespace, namespace)
-	controllerConfig.AddConfigItem(common.ConfigDashboardLabelSelector, "")
-	controllerConfig.AddConfigItem(common.ConfigOpenshift, openshift)
+	controllerConfig := config2.GetControllerConfig()
+	controllerConfig.AddConfigItem(config2.ConfigGrafanaImage, flagImage)
+	controllerConfig.AddConfigItem(config2.ConfigGrafanaImageTag, flagImageTag)
+	controllerConfig.AddConfigItem(config2.ConfigPluginsInitContainerImage, flagPluginsInitContainerImage)
+	controllerConfig.AddConfigItem(config2.ConfigPluginsInitContainerTag, flagPluginsInitContainerTag)
+	controllerConfig.AddConfigItem(config2.ConfigOperatorNamespace, namespace)
+	controllerConfig.AddConfigItem(config2.ConfigDashboardLabelSelector, "")
 
 	// Get the namespaces to scan for dashboards
 	// It's either the same namespace as the controller's or it's all namespaces if the
 	// --scan-all flag has been passed
-	var dashboardNamespace = namespace
+	var dashboardNamespaces = []string{namespace}
 	if scanAll {
-		dashboardNamespace = ""
+		dashboardNamespaces = []string{""}
 		log.Info("Scanning for dashboards in all namespaces")
+	}
+
+	if flagNamespaces != "" {
+		dashboardNamespaces = getSanitizedNamespaceList()
+		if len(dashboardNamespaces) == 0 {
+			fmt.Fprint(os.Stderr, "--namespaces provided but no valid namespaces in list")
+			os.Exit(1)
+		}
+		log.Info(fmt.Sprintf("Scanning for dashboards in the following namespaces: [%s]", strings.Join(dashboardNamespaces, ",")))
 	}
 
 	// Get a config to talk to the apiserver
@@ -131,7 +172,10 @@ func main() {
 	defer r.Unset()
 
 	// Create a new Cmd to provide shared dependencies and start components
-	mgr, err := manager.New(cfg, manager.Options{Namespace: namespace})
+	mgr, err := manager.New(cfg, manager.Options{
+		Namespace:          namespace,
+		MetricsBindAddress: fmt.Sprintf("%s:%d", metricsHost, metricsPort),
+	})
 	if err != nil {
 		log.Error(err, "")
 		os.Exit(1)
@@ -139,22 +183,54 @@ func main() {
 
 	log.Info("Registering Components.")
 
+	// Starting the resource auto-detection for the grafana controller
+	autodetect, err := common.NewAutoDetect(mgr)
+	if err != nil {
+		log.Error(err, "failed to start the background process to auto-detect the operator capabilities")
+	} else {
+		autodetect.Start()
+		defer autodetect.Stop()
+	}
+
 	// Setup Scheme for all resources
 	if err := apis.AddToScheme(mgr.GetScheme()); err != nil {
 		log.Error(err, "")
 		os.Exit(1)
 	}
 
-	// Setup all Controllers
-	if err := controller.AddToManager(mgr); err != nil {
+	// Setup Scheme for OpenShift routes
+	if err := routev1.AddToScheme(mgr.GetScheme()); err != nil {
 		log.Error(err, "")
 		os.Exit(1)
+	}
+
+	// Setup all Controllers
+	if err := controller.AddToManager(mgr, autodetect.SubscriptionChannel, namespace); err != nil {
+		log.Error(err, "")
+		os.Exit(1)
+	}
+
+	servicePorts := []v1.ServicePort{
+		{
+			Name:       metrics.OperatorPortName,
+			Protocol:   v1.ProtocolTCP,
+			Port:       metricsPort,
+			TargetPort: intstr.IntOrString{Type: intstr.Int, IntVal: metricsPort},
+		},
+	}
+	_, err = metrics.CreateMetricsService(context.TODO(), cfg, servicePorts)
+	if err != nil {
+		log.Error(err, "error starting metrics service")
 	}
 
 	log.Info("Starting the Cmd.")
 
 	signalHandler := signals.SetupSignalHandler()
-	startDashboardController(dashboardNamespace, cfg, signalHandler)
+
+	// Start one dashboard controller per watch namespace
+	for _, ns := range dashboardNamespaces {
+		startDashboardController(ns, cfg, signalHandler, autodetect.SubscriptionChannel)
+	}
 
 	if err := mgr.Start(signalHandler); err != nil {
 		log.Error(err, "manager exited non-zero")
